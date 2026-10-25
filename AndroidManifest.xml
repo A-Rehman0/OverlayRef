@@ -26,7 +26,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Shows a semi-transparent reference image over the camera app" />
+                android:value="Shows a semi-transparent reference image over the camera app (Dev:Abdul Rehman)" />
         </service>
     </application>
 </manifest>
