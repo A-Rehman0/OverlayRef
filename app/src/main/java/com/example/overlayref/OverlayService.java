@@ -11,34 +11,41 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.content.res.Configuration;
-import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.graphics.PixelFormat;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Icon;
+import android.graphics.drawable.RippleDrawable;
 import android.media.ExifInterface;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.provider.DocumentsContract;
 import android.provider.Settings;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.util.DisplayMetrics;
 import android.view.ContextThemeWrapper;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -53,20 +60,26 @@ import java.util.concurrent.Executors;
 
 /**
  * Draws a semi-transparent reference image over every other app (touches pass through it)
- * plus a small draggable "assistive ball" that opens a control panel.
+ * plus a draggable "assistive ball" that opens a control panel with a searchable image picker.
+ * Reference images are bundled in the APK (app/src/main/assets/references).
  */
 public class OverlayService extends Service {
     static final String ACTION_STOP = "com.example.overlayref.STOP";
     private static final String CHANNEL = "overlay";
-    private static final int BALL_DP = 52;
-    private static final float MIN_ALPHA = 0.10f;
-    // Android 12+ blocks touches that pass through an overlay window more opaque than 0.8
-    private static final float MAX_ALPHA = 0.80f;
+    private static final int BALL_DP = 56;
+    private static final int OP_MIN = 5;      // percent
+    private static final int OP_MAX = 100;    // percent
+    private static final int PANEL_DP = 300;
+
+    private static final int GREEN = 0xFF2E7D32;
+    private static final int RED = 0xFFB71C1C;
+    private static final int GREY = 0xFF3A3F47;
 
     private static final class Doc {
-        final Uri uri;
-        final String name;
-        Doc(Uri u, String n) { uri = u; name = n; }
+        final String path;   // path inside assets
+        final String name;   // file name
+        final String label;  // file name without extension
+        Doc(String p, String n) { path = p; name = n; label = stripExt(n); }
     }
 
     private interface IntCb { void on(int v); }
@@ -84,9 +97,15 @@ public class OverlayService extends Service {
     private WindowManager.LayoutParams ballLp;
     private LinearLayout panel;
     private WindowManager.LayoutParams panelLp;
-    private TextView title, opLabel, scLabel;
-    private Button toggleBtn;
-    private boolean overlayAttached, ballAttached, panelShown, destroyed;
+    private TextView opLabel, scLabel;
+    private Button selectorBtn, toggleBtn;
+    private LinearLayout pickerRoot;
+    private WindowManager.LayoutParams pickerLp;
+    private EditText search;
+    private ListView pickerList;
+    private PickAdapter pickAdapter;
+    private final List<Integer> filtered = new ArrayList<>();
+    private boolean overlayAttached, ballAttached, panelShown, pickerShown, destroyed;
 
     private List<Doc> docs = new ArrayList<>();
     private int index, dir = 1, loadToken, screenW, screenH, ballSize;
@@ -102,9 +121,8 @@ public class OverlayService extends Service {
         prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
         startForeground(1, buildNotification());
 
-        String tree = prefs.getString(MainActivity.KEY_TREE, null);
-        if (!Settings.canDrawOverlays(this) || tree == null) {
-            Toast.makeText(this, "Allow overlay permission and choose a folder first", Toast.LENGTH_LONG).show();
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Allow display over other apps first", Toast.LENGTH_LONG).show();
             stopSelf();
             return;
         }
@@ -114,23 +132,24 @@ public class OverlayService extends Service {
         ballSize = dp(BALL_DP);
         readScreen();
 
-        opacity = clampF(prefs.getFloat("opacity", 0.5f), MIN_ALPHA, MAX_ALPHA);
-        scale = prefs.getFloat("scale", 1f);
+        opacity = clampF(prefs.getFloat("opacity", 0.5f), OP_MIN / 100f, OP_MAX / 100f);
+        scale = clampF(prefs.getFloat("scale", 1f), 0.5f, 2f);
         overlayOn = prefs.getBoolean("on", true);
         index = prefs.getInt("index", 0);
 
         addOverlay();
         buildPanel();
+        buildPicker();
         addBall();
 
-        final Uri treeUri = Uri.parse(tree);
         io.execute(() -> {
-            final List<Doc> list = listImages(treeUri);
+            final List<Doc> list = listImages();
             main.post(() -> {
                 if (destroyed) return;
                 docs = list;
                 if (docs.isEmpty()) {
-                    Toast.makeText(this, "No images found in that folder", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "No images found. Put them in app/src/main/assets/references",
+                            Toast.LENGTH_LONG).show();
                 }
                 show(index);
             });
@@ -151,6 +170,7 @@ public class OverlayService extends Service {
         super.onConfigurationChanged(newConfig);
         if (wm == null) return;
         readScreen();
+        hidePicker();
         hidePanel();
         if (ballAttached) {
             ballLp.x = clampI(ballLp.x, 0, screenW - ballSize);
@@ -166,6 +186,7 @@ public class OverlayService extends Service {
         io.shutdownNow();
         if (wm != null) {
             savePrefs();
+            hidePicker();
             hidePanel();
             if (ballAttached) { wm.removeViewImmediate(ball); ballAttached = false; }
             if (overlayAttached) { wm.removeViewImmediate(overlayView); overlayAttached = false; }
@@ -180,10 +201,15 @@ public class OverlayService extends Service {
                 : WindowManager.LayoutParams.TYPE_PHONE;
     }
 
-    /** Full-screen reference image. NOT_TOUCHABLE lets every tap fall through to the app below. */
+    /**
+     * Full-screen reference image. NOT_TOUCHABLE lets every tap fall through to the app below.
+     * Opacity is set on the VIEW (not the window), because Android 12+ only lets touches pass through
+     * windows whose window-alpha is 0.8 or less. The window itself stays at alpha 1.0.
+     */
     private void addOverlay() {
         overlayView = new ImageView(ctx);
         overlayView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        overlayView.setAlpha(opacity);
         overlayView.setScaleX(scale);
         overlayView.setScaleY(scale);
         overlayView.setVisibility(overlayOn ? View.VISIBLE : View.GONE);
@@ -199,7 +225,6 @@ public class OverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.TRANSLUCENT);
         overlayLp.gravity = Gravity.TOP | Gravity.START;
-        overlayLp.alpha = opacity;
         if (Build.VERSION.SDK_INT >= 28) {
             overlayLp.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -213,7 +238,7 @@ public class OverlayService extends Service {
         ball = new TextView(ctx);
         ball.setGravity(Gravity.CENTER);
         ball.setTextColor(0xFFFFFFFF);
-        ball.setTextSize(22);
+        ball.setTextSize(24);
         GradientDrawable bg = new GradientDrawable();
         bg.setShape(GradientDrawable.OVAL);
         bg.setStroke(dp(2), 0xFFFFFFFF);
@@ -307,46 +332,47 @@ public class OverlayService extends Service {
     private void buildPanel() {
         panel = new LinearLayout(ctx);
         panel.setOrientation(LinearLayout.VERTICAL);
-        int p = dp(12);
-        panel.setPadding(p, p, p, p);
+        panel.setPadding(dp(16), dp(14), dp(16), dp(16));
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xE6141414);
-        bg.setCornerRadius(dp(14));
+        bg.setColor(0xF2171A1F);
+        bg.setCornerRadius(dp(18));
         panel.setBackground(bg);
 
-        title = label("-");
-        title.setSingleLine(true);
-        title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-        panel.addView(title);
+        panel.addView(label("Reference image", 0));
+        selectorBtn = btn("", GREY, v -> showPicker());
+        selectorBtn.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        selectorBtn.setSingleLine(true);
+        selectorBtn.setEllipsize(TextUtils.TruncateAt.END);
+        panel.addView(selectorBtn, lp(ViewGroup.LayoutParams.MATCH_PARENT, 6, 0, 0));
 
-        opLabel = label("");
+        opLabel = label("", 18);
         panel.addView(opLabel);
-        int opMax = Math.round((MAX_ALPHA - MIN_ALPHA) * 100);
-        panel.addView(seek(opMax, Math.round((opacity - MIN_ALPHA) * 100), v -> {
-            opacity = MIN_ALPHA + v / 100f;
+        panel.addView(seek(OP_MAX - OP_MIN, Math.round(opacity * 100) - OP_MIN, v -> {
+            opacity = (v + OP_MIN) / 100f;
             applyOpacity();
-        }));
+        }), lp(ViewGroup.LayoutParams.MATCH_PARENT, 4, 0, 0));
 
-        scLabel = label("");
+        scLabel = label("", 14);
         panel.addView(scLabel);
         panel.addView(seek(150, Math.round(scale * 100) - 50, v -> {
             scale = (v + 50) / 100f;
             applyScale();
-        }));
+        }), lp(ViewGroup.LayoutParams.MATCH_PARENT, 4, 0, 0));
 
         LinearLayout nav = row();
-        nav.addView(btn("◀ Prev", v -> show(index - 1)));
-        nav.addView(btn("Next ▶", v -> show(index + 1)));
-        panel.addView(nav);
+        nav.addView(half(btn("◀  Prev", GREY, v -> show(index - 1)), true));
+        nav.addView(half(btn("Next  ▶", GREY, v -> show(index + 1)), false));
+        panel.addView(nav, lp(ViewGroup.LayoutParams.MATCH_PARENT, 18, 0, 0));
 
         LinearLayout act = row();
-        toggleBtn = btn("", v -> toggleOverlay());
-        act.addView(toggleBtn);
-        act.addView(btn("Stop", v -> stopSelf()));
-        panel.addView(act);
+        toggleBtn = btn("", GREEN, v -> toggleOverlay());
+        act.addView(half(toggleBtn, true));
+        act.addView(half(btn("Stop app", RED, v -> stopSelf()), false));
+        panel.addView(act, lp(ViewGroup.LayoutParams.MATCH_PARENT, 12, 0, 0));
 
         panelLp = new WindowManager.LayoutParams(
-                dp(260), WindowManager.LayoutParams.WRAP_CONTENT, windowType(),
+                Math.min(dp(PANEL_DP), screenW - dp(16)), WindowManager.LayoutParams.WRAP_CONTENT,
+                windowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                         | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
@@ -364,7 +390,8 @@ public class OverlayService extends Service {
 
     private void showPanel() {
         if (panelShown || destroyed) return;
-        int w = dp(260);
+        int w = Math.min(dp(PANEL_DP), screenW - dp(16));
+        panelLp.width = w;
         panel.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
         int h = panel.getMeasuredHeight();
@@ -381,17 +408,149 @@ public class OverlayService extends Service {
         panelShown = false;
     }
 
+    // ------------------------------------------------------------ searchable image picker
+    /** Like Streamlit's selectbox: a list of all images with a search box on top. */
+    private void buildPicker() {
+        pickerRoot = new LinearLayout(ctx) {
+            @Override
+            public boolean dispatchKeyEvent(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+                    if (e.getAction() == KeyEvent.ACTION_UP) hidePicker();
+                    return true;
+                }
+                return super.dispatchKeyEvent(e);
+            }
+        };
+        pickerRoot.setOrientation(LinearLayout.VERTICAL);
+        pickerRoot.setPadding(dp(14), dp(14), dp(14), dp(14));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFA171A1F);
+        bg.setCornerRadius(dp(18));
+        pickerRoot.setBackground(bg);
+
+        LinearLayout head = row();
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView t = new TextView(ctx);
+        t.setText("Choose reference image");
+        t.setTextColor(0xFFFFFFFF);
+        t.setTextSize(16);
+        t.setTypeface(null, Typeface.BOLD);
+        head.addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button close = btn("✕", GREY, v -> hidePicker());
+        head.addView(close, new LinearLayout.LayoutParams(dp(48), dp(44)));
+        pickerRoot.addView(head);
+
+        search = new EditText(ctx);
+        search.setHint("Search...");
+        search.setHintTextColor(0xFF8A8F98);
+        search.setTextColor(0xFFFFFFFF);
+        search.setTextSize(15);
+        search.setSingleLine(true);
+        search.setPadding(dp(14), dp(10), dp(14), dp(10));
+        GradientDrawable sbg = new GradientDrawable();
+        sbg.setColor(GREY);
+        sbg.setCornerRadius(dp(12));
+        search.setBackground(sbg);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) { }
+            @Override public void afterTextChanged(Editable s) { applyFilter(s.toString()); }
+        });
+        pickerRoot.addView(search, lp(ViewGroup.LayoutParams.MATCH_PARENT, 12, 0, 0));
+
+        pickerList = new ListView(ctx);
+        pickerList.setDividerHeight(0);
+        pickAdapter = new PickAdapter();
+        pickerList.setAdapter(pickAdapter);
+        pickerList.setOnItemClickListener((p, v, pos, id) -> {
+            int idx = filtered.get(pos);
+            hidePicker();
+            show(idx);
+        });
+        pickerRoot.addView(pickerList, lp(ViewGroup.LayoutParams.MATCH_PARENT, 10, 0, 0));
+        ((LinearLayout.LayoutParams) pickerList.getLayoutParams()).height = 0;
+        ((LinearLayout.LayoutParams) pickerList.getLayoutParams()).weight = 1f;
+
+        pickerLp = new WindowManager.LayoutParams(
+                0, 0, windowType(),
+                WindowManager.LayoutParams.FLAG_DIM_BEHIND
+                        | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT);
+        pickerLp.dimAmount = 0.45f;
+        pickerLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        pickerLp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
+    }
+
+    private void showPicker() {
+        if (pickerShown || destroyed || docs.isEmpty()) return;
+        hidePanel();
+        pickerLp.width = screenW - dp(24);
+        pickerLp.height = Math.min(Math.round(screenH * 0.62f), dp(560));
+        pickerLp.y = dp(48);
+        search.setText("");
+        applyFilter("");
+        wm.addView(pickerRoot, pickerLp);
+        pickerShown = true;
+        pickerList.setSelectionFromTop(Math.max(0, index - 2), 0);
+    }
+
+    private void hidePicker() {
+        if (!pickerShown) return;
+        try {
+            ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                    .hideSoftInputFromWindow(search.getWindowToken(), 0);
+        } catch (Exception ignored) {
+        }
+        wm.removeViewImmediate(pickerRoot);
+        pickerShown = false;
+    }
+
+    private void applyFilter(String q) {
+        String needle = q.trim().toLowerCase(Locale.ROOT);
+        filtered.clear();
+        for (int i = 0; i < docs.size(); i++) {
+            if (needle.isEmpty() || docs.get(i).label.toLowerCase(Locale.ROOT).contains(needle)) {
+                filtered.add(i);
+            }
+        }
+        pickAdapter.notifyDataSetChanged();
+    }
+
+    private final class PickAdapter extends BaseAdapter {
+        @Override public int getCount() { return filtered.size(); }
+        @Override public Object getItem(int p) { return filtered.get(p); }
+        @Override public long getItemId(int p) { return p; }
+
+        @Override
+        public View getView(int pos, View convert, ViewGroup parent) {
+            TextView t = convert instanceof TextView ? (TextView) convert : new TextView(ctx);
+            int idx = filtered.get(pos);
+            boolean cur = idx == index;
+            t.setText((idx + 1) + ".   " + docs.get(idx).label);
+            t.setTextSize(15);
+            t.setTextColor(0xFFFFFFFF);
+            t.setSingleLine(true);
+            t.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            t.setGravity(Gravity.CENTER_VERTICAL);
+            t.setPadding(dp(14), dp(13), dp(14), dp(13));
+            GradientDrawable g = new GradientDrawable();
+            g.setColor(cur ? GREEN : 0x00000000);
+            g.setCornerRadius(dp(10));
+            t.setBackground(g);
+            return t;
+        }
+    }
+
     // ------------------------------------------------------------ actions
     private void applyOpacity() {
-        overlayLp.alpha = opacity;
-        if (overlayAttached) wm.updateViewLayout(overlayView, overlayLp);
-        opLabel.setText("Opacity " + Math.round(opacity * 100) + "%");
+        overlayView.setAlpha(opacity);
+        opLabel.setText("Opacity   " + Math.round(opacity * 100) + "%");
     }
 
     private void applyScale() {
         overlayView.setScaleX(scale);
         overlayView.setScaleY(scale);
-        scLabel.setText("Size " + Math.round(scale * 100) + "%");
+        scLabel.setText("Size   " + Math.round(scale * 100) + "%");
     }
 
     private void toggleOverlay() {
@@ -406,12 +565,16 @@ public class OverlayService extends Service {
             ball.setText(overlayOn ? "◐" : "○");
             ((GradientDrawable) ball.getBackground()).setColor(overlayOn ? 0xD92E7D32 : 0xD9B71C1C);
         }
-        if (toggleBtn != null) toggleBtn.setText(overlayOn ? "Overlay: ON" : "Overlay: OFF");
+        if (toggleBtn != null) {
+            toggleBtn.setText(overlayOn ? "Overlay: ON" : "Overlay: OFF");
+            setBtnColor(toggleBtn, overlayOn ? GREEN : RED);
+        }
     }
 
     private void updateTitle() {
-        title.setText(docs.isEmpty() ? "No images in folder"
-                : (index + 1) + " / " + docs.size() + "  " + docs.get(index).name);
+        if (selectorBtn == null) return;
+        selectorBtn.setText(docs.isEmpty() ? "No images found"
+                : "▾  " + (index + 1) + " / " + docs.size() + "   " + docs.get(index).label);
     }
 
     private void savePrefs() {
@@ -437,9 +600,9 @@ public class OverlayService extends Service {
         prefs.edit().putInt("index", index).apply();
 
         final int token = ++loadToken;
-        final Uri uri = docs.get(idx).uri;
+        final String path = docs.get(idx).path;
         final int preIdx = idx + dir;
-        final Uri preUri = (preIdx >= 0 && preIdx < docs.size()) ? docs.get(preIdx).uri : null;
+        final String prePath = (preIdx >= 0 && preIdx < docs.size()) ? docs.get(preIdx).path : null;
 
         io.execute(() -> {
             Bitmap b = null;
@@ -450,13 +613,13 @@ public class OverlayService extends Service {
                     prefetchIdx = -1;
                 }
             }
-            if (b == null) b = decode(uri);
+            if (b == null) b = decode(path);
             final Bitmap shown = b;
             main.post(() -> {
                 if (!destroyed && token == loadToken) overlayView.setImageBitmap(shown);
             });
-            if (preUri != null) {
-                Bitmap pb = decode(preUri);
+            if (prePath != null) {
+                Bitmap pb = decode(prePath);
                 synchronized (cacheLock) {
                     prefetchBmp = pb;
                     prefetchIdx = preIdx;
@@ -466,11 +629,11 @@ public class OverlayService extends Service {
     }
 
     /** Decodes at (about) screen size so memory stays small, and fixes EXIF rotation. */
-    private Bitmap decode(Uri uri) {
+    private Bitmap decode(String path) {
         try {
             BitmapFactory.Options o = new BitmapFactory.Options();
             o.inJustDecodeBounds = true;
-            try (InputStream in = getContentResolver().openInputStream(uri)) {
+            try (InputStream in = getAssets().open(path)) {
                 BitmapFactory.decodeStream(in, null, o);
             }
             int sample = 1;
@@ -480,10 +643,10 @@ public class OverlayService extends Service {
             o.inJustDecodeBounds = false;
             o.inSampleSize = sample;
             Bitmap b;
-            try (InputStream in = getContentResolver().openInputStream(uri)) {
+            try (InputStream in = getAssets().open(path)) {
                 b = BitmapFactory.decodeStream(in, null, o);
             }
-            int rot = exifRotation(uri);
+            int rot = exifRotation(path);
             if (b != null && rot != 0) {
                 Matrix m = new Matrix();
                 m.postRotate(rot);
@@ -495,8 +658,8 @@ public class OverlayService extends Service {
         }
     }
 
-    private int exifRotation(Uri uri) {
-        try (InputStream in = getContentResolver().openInputStream(uri)) {
+    private int exifRotation(String path) {
+        try (InputStream in = getAssets().open(path)) {
             ExifInterface ex = new ExifInterface(in);
             switch (ex.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
                 case ExifInterface.ORIENTATION_ROTATE_90: return 90;
@@ -509,28 +672,29 @@ public class OverlayService extends Service {
         }
     }
 
-    private List<Doc> listImages(Uri tree) {
+    private List<Doc> listImages() {
         List<Doc> out = new ArrayList<>();
         try {
-            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(
-                    tree, DocumentsContract.getTreeDocumentId(tree));
-            String[] proj = {
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE};
-            try (Cursor c = getContentResolver().query(children, proj, null, null, null)) {
-                while (c != null && c.moveToNext()) {
-                    String mime = c.getString(2);
-                    if (mime != null && mime.startsWith("image/")) {
-                        out.add(new Doc(DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0)),
-                                c.getString(1)));
-                    }
+            String[] files = getAssets().list(MainActivity.ASSET_DIR);
+            if (files != null) {
+                for (String f : files) {
+                    if (isImage(f)) out.add(new Doc(MainActivity.ASSET_DIR + "/" + f, f));
                 }
             }
         } catch (Exception ignored) {
         }
         Collections.sort(out, (a, b) -> naturalCompare(a.name, b.name));
         return out;
+    }
+
+    static boolean isImage(String name) {
+        String n = name.toLowerCase(Locale.ROOT);
+        return n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp");
+    }
+
+    static String stripExt(String n) {
+        int d = n.lastIndexOf('.');
+        return d > 0 ? n.substring(0, d) : n;
     }
 
     /** "img2" sorts before "img10", like natural_key() in the Python version. */
@@ -558,7 +722,7 @@ public class OverlayService extends Service {
         return (a.length() - i) - (b.length() - j);
     }
 
-    // ------------------------------------------------------------ small helpers
+    // ------------------------------------------------------------ ui helpers
     private Notification buildNotification() {
         Notification.Builder b;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -581,12 +745,15 @@ public class OverlayService extends Service {
                 .build();
     }
 
-    private TextView label(String text) {
+    private TextView label(String text, int topDp) {
         TextView t = new TextView(ctx);
         t.setText(text);
-        t.setTextColor(0xFFFFFFFF);
+        t.setTextColor(0xFFB8BDC6);
         t.setTextSize(13);
-        t.setPadding(0, dp(6), 0, 0);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.topMargin = dp(topDp);
+        t.setLayoutParams(p);
         return t;
     }
 
@@ -594,6 +761,7 @@ public class OverlayService extends Service {
         SeekBar s = new SeekBar(ctx);
         s.setMax(max);
         s.setProgress(progress);
+        s.setPadding(dp(8), dp(10), dp(8), dp(10));
         s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar sb, int v, boolean fromUser) {
                 if (fromUser) cb.on(v);
@@ -610,14 +778,40 @@ public class OverlayService extends Service {
         return r;
     }
 
-    private Button btn(String text, View.OnClickListener l) {
+    /** Makes a button share a row equally, with a gap between neighbours. */
+    private Button half(Button b, boolean first) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(46), 1f);
+        if (first) p.rightMargin = dp(6); else p.leftMargin = dp(6);
+        b.setLayoutParams(p);
+        return b;
+    }
+
+    private Button btn(String text, int color, View.OnClickListener l) {
         Button b = new Button(ctx);
         b.setText(text);
         b.setAllCaps(false);
-        b.setTextSize(12);
+        b.setTextSize(14);
+        b.setTextColor(0xFFFFFFFF);
+        b.setStateListAnimator(null);
+        b.setMinHeight(0);
+        b.setMinimumHeight(dp(44));
+        b.setPadding(dp(14), dp(8), dp(14), dp(8));
+        setBtnColor(b, color);
         b.setOnClickListener(l);
-        b.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         return b;
+    }
+
+    private void setBtnColor(Button b, int color) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(12));
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x44FFFFFF), g, null));
+    }
+
+    private LinearLayout.LayoutParams lp(int w, int top, int left, int right) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.setMargins(dp(left), dp(top), dp(right), 0);
+        return p;
     }
 
     private void readScreen() {
