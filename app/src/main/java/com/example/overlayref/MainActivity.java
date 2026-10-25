@@ -61,7 +61,8 @@ public class MainActivity extends Activity {
         TextView help = text("Floating ball:\n"
                 + "• Tap: open the control panel\n"
                 + "• Long-press: overlay on / off\n"
-                + "• Drag: move it (snaps to the edge)", 14, 0xFF555555, false);
+                + "• Drag: move it (snaps to the edge)"
+                + "• Dev : Abdul Rehman T.", 14, 0xFF555555, false);
         help.setLineSpacing(0, 1.3f);
         root.addView(help);
 
